@@ -1,0 +1,21 @@
+# API credentials – never commit!
+.env
+
+# Personal data generated at runtime
+aliases.json
+config.json
+
+# Bank export CSVs – contain private financial data
+*.csv
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
