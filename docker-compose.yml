@@ -1,0 +1,17 @@
+services:
+  ynab-reconcile:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - YNAB_API_TOKEN=${YNAB_API_TOKEN}
+      - DATA_DIR=/data
+      # Set to 1 to enable Flask debug mode (local dev only)
+      # - FLASK_DEBUG=1
+    volumes:
+      # Persistent storage for aliases.json and config.json
+      - ynab-data:/data
+    restart: unless-stopped
+
+volumes:
+  ynab-data:

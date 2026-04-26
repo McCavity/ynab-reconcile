@@ -4,28 +4,28 @@ YNAB Abgleich-Tool
 Interaktiver Abgleich von YNAB-Transaktionen mit Kontoauszugsdaten (z.B. aus Finanzblick)
 """
 
-import os
-import re
-import sys
-import csv
-import json
 import difflib
-import urllib.request
-import urllib.error
-from pathlib import Path
+import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-BASE_URL = "https://api.ynab.com/v1"
+from core.api import APIError, TokenNotFoundError, api_get, api_patch, api_post, load_token
+from core.csv_parser import parse_finanzblick_csv
+from core.matching import match_transactions
+from core.parsing import parse_amount
+from core.state import (add_deferred_payee, load_aliases, load_config,
+                        resolve_alias, save_alias)
+from core.ynab import load_ynab_categories, load_ynab_payees
 
 # ── Farben ────────────────────────────────────────────────────────────────────
-G  = "\033[32m"   # grün
-Y  = "\033[33m"   # gelb
-R  = "\033[31m"   # rot
-C  = "\033[36m"   # cyan
-W  = "\033[1m"    # fett
-DIM= "\033[2m"    # gedimmt
-X  = "\033[0m"    # reset
+G   = "\033[32m"
+Y   = "\033[33m"
+R   = "\033[31m"
+C   = "\033[36m"
+W   = "\033[1m"
+DIM = "\033[2m"
+X   = "\033[0m"
 
 def ok(s):   return f"{G}{s}{X}"
 def warn(s): return f"{Y}{s}{X}"
@@ -34,88 +34,6 @@ def bold(s): return f"{W}{s}{X}"
 def info(s): return f"{C}{s}{X}"
 def dim(s):  return f"{DIM}{s}{X}"
 
-# ── Token laden ───────────────────────────────────────────────────────────────
-def load_token() -> str:
-    token = os.environ.get("YNAB_API_TOKEN", "")
-    if token and token != "dein_token_hier_eintragen":
-        return token
-    env_file = Path(__file__).parent / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("YNAB_API_TOKEN=") and not line.startswith("#"):
-                token = line.split("=", 1)[1].strip()
-                if token and token != "dein_token_hier_eintragen":
-                    return token
-    print(err("❌ Kein API-Token gefunden! Bitte .env-Datei anlegen."))
-    sys.exit(1)
-
-# ── API-Hilfsfunktionen ───────────────────────────────────────────────────────
-def api_get(path: str, token: str) -> dict:
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        headers={"Authorization": f"Bearer {token}"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        print(err(f"❌ HTTP {e.code}: {e.read().decode()}"))
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        print(err(f"❌ Verbindungsfehler: {e.reason}"))
-        sys.exit(1)
-
-def api_patch(path: str, data: dict, token: str) -> dict:
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}", data=body, method="PATCH",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        print(err(f"❌ HTTP {e.code}: {e.read().decode()}"))
-        return {}
-
-def api_post(path: str, data: dict, token: str) -> dict:
-    body = json.dumps(data).encode()
-    req = urllib.request.Request(
-        f"{BASE_URL}{path}", data=body, method="POST",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        print(err(f"❌ HTTP {e.code}: {e.read().decode()}"))
-        return {}
-
-# ── Betrags-Parsing ───────────────────────────────────────────────────────────
-def parse_amount(s: str) -> Optional[float]:
-    """Parst deutschen oder englischen Betragsstring zu float."""
-    s = s.strip().replace("€", "").replace("EUR", "").replace("+", "").strip()
-    # Negativ-Zeichen erhalten
-    negative = s.startswith("-")
-    s = s.lstrip("-").strip()
-    # Tausender- und Dezimaltrenner erkennen
-    if "," in s and "." in s:
-        # Welches kommt zuletzt?
-        if s.rindex(",") > s.rindex("."):
-            # Deutsch: 1.234,56
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # Englisch: 1,234.56
-            s = s.replace(",", "")
-    elif "," in s:
-        # Nur Komma → Dezimaltrenner (deutsch)
-        s = s.replace(",", ".")
-    try:
-        val = float(s)
-        return -val if negative else val
-    except ValueError:
-        return None
 
 def fmt_eur(amount_float: float, colored: bool = True) -> str:
     s = f"{amount_float:+.2f} €"
@@ -123,128 +41,13 @@ def fmt_eur(amount_float: float, colored: bool = True) -> str:
         return s
     return err(s) if amount_float < 0 else ok(s)
 
-# ── Payee-Alias-System ────────────────────────────────────────────────────────
-# Speichert Zuordnungen: Bank-Payee (lowercase) → YNAB-Payee-Name
-# Datei: aliases.json im selben Ordner wie das Skript
 
-ALIASES_FILE = Path(__file__).parent / "aliases.json"
-
-def load_aliases() -> dict:
-    """Lädt gespeicherte Payee-Aliases aus aliases.json."""
-    if ALIASES_FILE.exists():
-        try:
-            return json.loads(ALIASES_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def save_alias(bank_payee: str, ynab_payee: str) -> None:
-    """Speichert einen neuen Alias dauerhaft."""
-    aliases = load_aliases()
-    aliases[bank_payee.lower().strip()] = ynab_payee.strip()
-    ALIASES_FILE.write_text(
-        json.dumps(aliases, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-    print(ok(f"  💾 Alias gespeichert: '{bank_payee}' → '{ynab_payee}'"))
-
-def resolve_alias(bank_payee: str, aliases: dict) -> str:
-    """
-    Gibt den YNAB-Payee-Namen für einen Bank-Payee zurück (wenn Alias vorhanden),
-    sonst den Original-Bank-Payee-Namen.
-    Sucht zuerst exakt, dann nach ob der Bank-Payee einen bekannten Alias enthält.
-    """
-    key = bank_payee.lower().strip()
-    if key in aliases:
-        return aliases[key]
-    # Teilstring-Suche: z.B. "Takeaway.com GmbH" matcht Alias "takeaway.com"
-    for alias_key, ynab_name in aliases.items():
-        if alias_key in key or key in alias_key:
-            return ynab_name
-    return bank_payee
-
-# ── Konfiguration (Dauerbucher / deferred payees) ────────────────────────────
-# Speichert Payees, deren YNAB-Einträge automatisch übersprungen werden,
-# weil sie monatlich aufsummiert abgerechnet werden (z.B. RMV).
-# Datei: config.json im selben Ordner wie das Skript
-
-CONFIG_FILE = Path(__file__).parent / "config.json"
-
-def load_config() -> dict:
-    """Lädt die Konfigurationsdatei (oder gibt Standardwerte zurück)."""
-    defaults = {"deferred_payees": []}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            defaults.update(data)
-        except Exception:
-            pass
-    return defaults
-
-def save_config(config: dict) -> None:
-    """Speichert die Konfiguration dauerhaft."""
-    CONFIG_FILE.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
-
-def is_deferred_payee(payee_name: str, config: dict) -> bool:
-    """Prüft ob ein Payee in der Dauerbucher-Liste steht (Teilstring-Suche)."""
-    if not payee_name:
-        return False
-    lower = payee_name.lower()
-    return any(kw in lower for kw in config.get("deferred_payees", []))
-
-def add_deferred_payee(payee_name: str, config: dict) -> None:
-    """Fügt einen Payee zur Dauerbucher-Liste hinzu und speichert."""
-    # Kürzestes sinnvolles Schlüsselwort: erstes Wort (mindestens 4 Zeichen)
-    words = payee_name.lower().split()
-    keyword = next((w for w in words if len(w) >= 4), payee_name.lower()[:10])
-    if keyword not in config["deferred_payees"]:
-        config["deferred_payees"].append(keyword)
-        save_config(config)
-        print(ok(f"  💾 Dauerbucher gespeichert: '{keyword}' (aus '{payee_name}')"))
-
-
-# ── YNAB-Stammdaten laden ────────────────────────────────────────────────────
-def load_ynab_payees(budget_id: str, token: str) -> list:
-    """Lädt alle Payees aus YNAB (ohne gelöschte)."""
-    data = api_get(f"/budgets/{budget_id}/payees", token)
-    return [p for p in data["data"]["payees"] if not p.get("deleted")]
-
-def load_ynab_categories(budget_id: str, token: str) -> list:
-    """
-    Lädt alle Kategorien aus YNAB als flache Liste mit Gruppenname.
-    Gibt eine Liste von Dicts: {id, name, group_name} zurück.
-    """
-    data = api_get(f"/budgets/{budget_id}/categories", token)
-    result = []
-    for group in data["data"]["category_groups"]:
-        if group.get("deleted") or group.get("hidden"):
-            continue
-        group_name = group["name"]
-        for cat in group.get("categories", []):
-            if cat.get("deleted") or cat.get("hidden"):
-                continue
-            result.append({
-                "id":         cat["id"],
-                "name":       cat["name"],
-                "group_name": group_name,
-                "display":    f"{group_name} › {cat['name']}"
-            })
-    return result
-
+# ── Payee-Auswahl (interaktiv) ────────────────────────────────────────────────
 def fuzzy_pick_payee(query: str, payees: list) -> str:
-    """
-    Sucht fuzzy in der YNAB-Payee-Liste und lässt den User auswählen.
-    Gibt den gewählten Payee-Namen zurück (oder den eingetippten Query wenn kein Match).
-    """
     if not query or not payees:
         return query
     lower = query.lower()
-    # Zuerst: Payees die den Query enthalten
     matches = [p for p in payees if lower in p["name"].lower()]
-    # Falls zu viele: nach Ähnlichkeit sortieren
     if not matches:
         scored = sorted(
             payees,
@@ -257,9 +60,8 @@ def fuzzy_pick_payee(query: str, payees: list) -> str:
 
     if not matches:
         return query
-
     if len(matches) == 1 and matches[0]["name"].lower() == lower:
-        return matches[0]["name"]  # exakter Treffer, direkt zurückgeben
+        return matches[0]["name"]
 
     print(f"  {dim('Gefundene Payees:')}")
     for i, p in enumerate(matches, 1):
@@ -275,11 +77,8 @@ def fuzzy_pick_payee(query: str, payees: list) -> str:
     except (ValueError, IndexError):
         return query
 
+
 def pick_category(categories: list) -> Optional[str]:
-    """
-    Lässt den User eine Kategorie aus der YNAB-Liste wählen.
-    Gibt die Kategorie-ID zurück oder None wenn keine gewählt.
-    """
     if not categories:
         return None
 
@@ -290,14 +89,13 @@ def pick_category(categories: list) -> Optional[str]:
     lower = query.lower()
     matches = [c for c in categories if lower in c["display"].lower()]
     if not matches:
-        # Fuzzy fallback
         matches = sorted(
             categories,
             key=lambda c: difflib.SequenceMatcher(None, lower, c["display"].lower()).ratio(),
             reverse=True
         )[:5]
-
     matches = matches[:6]
+
     if not matches:
         print(warn("  Keine Kategorie gefunden."))
         return None
@@ -320,16 +118,9 @@ def pick_category(categories: list) -> Optional[str]:
 # ── Dialog: neue Transaktion in YNAB anlegen ──────────────────────────────────
 def create_new_transaction_dialog(bt: dict, account_id: str, aliases: dict,
                                   payees: list, categories: list) -> Optional[dict]:
-    """
-    Interaktiver Dialog zum Anlegen einer neuen YNAB-Transaktion.
-    Enthält Payee-Suche, Kategorie-Auswahl, Datum und Betrag.
-    Am Ende: Zusammenfassung mit [s]peichern / [w]iederholen / [a]bbrechen.
-    Gibt ein fertiges Transaktions-Dict zurück oder None wenn abgebrochen.
-    """
     while True:
         print()
 
-        # ── Datum ──────────────────────────────────────────────────────────────
         default_date = bt["date"].strftime("%d.%m.%Y")
         raw_date = input(f"  Datum [{default_date}] (Enter = übernehmen): ").strip()
         if raw_date:
@@ -347,7 +138,6 @@ def create_new_transaction_dialog(bt: dict, account_id: str, aliases: dict,
         else:
             tx_date = bt["date"]
 
-        # ── Payee ───────────────────────────────────────────────────────────────
         default_payee = resolve_alias(bt["payee"], aliases)
         print(f"  Payee suchen/eingeben [{dim(default_payee)}]:")
         raw_payee = input("  → ").strip()
@@ -356,20 +146,16 @@ def create_new_transaction_dialog(bt: dict, account_id: str, aliases: dict,
         else:
             payee_name = fuzzy_pick_payee(raw_payee, payees)
 
-        # ── Kategorie ───────────────────────────────────────────────────────────
         category_id = pick_category(categories)
 
-        # ── Betrag ──────────────────────────────────────────────────────────────
         raw_amt = input(f"  Betrag [{bt['amount']:+.2f} €] (Enter = übernehmen): ").strip()
         amount = parse_amount(raw_amt) if raw_amt else bt["amount"]
         if amount is None:
             print(warn("  ⚠️  Ungültiger Betrag, verwende Bank-Betrag."))
             amount = bt["amount"]
 
-        # ── Memo ────────────────────────────────────────────────────────────────
         memo = input("  Memo (optional): ").strip()
 
-        # ── Zusammenfassung & Bestätigung ───────────────────────────────────────
         cat_display = next((c["display"] for c in categories if c["id"] == category_id), "—")
         print(f"\n  {bold('Neue Transaktion – Zusammenfassung:')}")
         print(f"    Datum:      {tx_date.strftime('%d.%m.%Y')}")
@@ -393,99 +179,19 @@ def create_new_transaction_dialog(bt: dict, account_id: str, aliases: dict,
             }
             if category_id:
                 tx["category_id"] = category_id
-            # Alias anbieten wenn Payee vom Bank-Namen abweicht
             if payee_name != bt["payee"]:
                 _offer_alias(bt["payee"], payee_name, aliases)
             return tx
 
         elif confirm == "w":
             print(info("  🔄 Eingabe wiederholen..."))
-            continue  # Dialog neu starten
+            continue
 
-        else:  # "a" oder alles andere
+        else:
             return None
 
 
-# ── Finanzblick CSV-Parser ────────────────────────────────────────────────────
-# Spalten: Buchungsdatum;Wertstellungsdatum;Empfaenger;Verwendungszweck;
-#          Buchungstext;Betrag;IBAN;BIC;Kategorie;Konto;Umbuchung;Notiz;
-#          Schlagworte;SteuerKategorie;ParentKategorie;AbweichenderEmpfaenger;
-#          Splitbuchung;Auswertungsdatum
-
-def _extract_payee_from_csv_row(empfaenger: str, verwendungszweck: str, abweichend: str) -> str:
-    """
-    Ermittelt den besten Payee-Namen aus einer Finanzblick-CSV-Zeile.
-    Priorität:
-      1. Für PayPal: echten Händler aus dem Verwendungszweck extrahieren
-      2. AbweichenderEmpfaenger (wenn vorhanden)
-      3. Empfaenger
-    """
-    # PayPal: echter Händler steckt im Verwendungszweck
-    if "paypal" in empfaenger.lower():
-        # Muster: "PP.1234.PP/. Händlername, Ihr Einkauf bei ..."
-        m = re.search(r'/\.\s+(.+?),\s*(?:Ihr Einkauf|EREF|MREF)', verwendungszweck)
-        if m:
-            return m.group(1).strip()
-
-    if abweichend.strip():
-        return abweichend.strip()
-
-    return empfaenger.strip()
-
-
-def parse_finanzblick_csv(filepath: str) -> list:
-    """Liest eine Buchungsliste-CSV aus Finanzblick und gibt eine Liste von Transaktions-Dicts zurück."""
-    transactions = []
-    skipped = []
-
-    with open(filepath, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f, delimiter=";")
-        for row in reader:
-            # Datum
-            date_str = row.get("Buchungsdatum", "").strip()
-            parsed_date = None
-            for fmt in ["%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"]:
-                try:
-                    parsed_date = datetime.strptime(date_str, fmt).date()
-                    break
-                except ValueError:
-                    continue
-            if not parsed_date:
-                skipped.append(date_str)
-                continue
-
-            # Betrag
-            amount = parse_amount(row.get("Betrag", ""))
-            if amount is None:
-                skipped.append(row.get("Betrag", "?"))
-                continue
-
-            payee = _extract_payee_from_csv_row(
-                empfaenger      = row.get("Empfaenger", ""),
-                verwendungszweck= row.get("Verwendungszweck", ""),
-                abweichend      = row.get("AbweichenderEmpfaenger", "")
-            )
-
-            transactions.append({
-                "date":   parsed_date,
-                "amount": amount,
-                "payee":  payee,
-                "memo":   row.get("Verwendungszweck", "").strip()[:100],
-                "raw":    f"{date_str} {amount:+.2f} {payee}"
-            })
-
-    if skipped:
-        print(warn(f"⚠️  {len(skipped)} Zeile(n) übersprungen (nicht parsbar)."))
-
-    return transactions
-
-
-def find_csv_files(folder: Path) -> list:
-    """Findet alle CSV-Dateien im angegebenen Ordner."""
-    return sorted(folder.glob("*.csv"))
-
-
-# ── Bank-Transaktionen einlesen ───────────────────────────────────────────────
+# ── Bank-Transaktionen manuell einfügen ──────────────────────────────────────
 def read_bank_transactions() -> list:
     print(f"""
 {bold('Bank-Transaktionen einfügen:')}
@@ -517,21 +223,18 @@ Leere Zeile eingeben zum Abschließen:
     skipped = []
 
     for line in lines:
-        # Trennzeichen ermitteln
         parts = None
         for sep in ["\t", ";", "|"]:
             if sep in line:
                 parts = [p.strip() for p in line.split(sep, 2)]
                 break
         if parts is None:
-            # Leerzeichen: erstes Token = Datum, zweites = Betrag, Rest = Beschreibung
             parts = line.split(None, 2)
 
         if len(parts) < 2:
             skipped.append(line)
             continue
 
-        # Datum parsen
         date_str = parts[0].strip()
         parsed_date = None
         for fmt in ["%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d", "%d/%m/%Y"]:
@@ -545,7 +248,6 @@ Leere Zeile eingeben zum Abschließen:
             skipped.append(line)
             continue
 
-        # Betrag parsen
         amount = parse_amount(parts[1])
         if amount is None:
             skipped.append(line)
@@ -567,123 +269,10 @@ Leere Zeile eingeben zum Abschließen:
 
     return transactions
 
-# ── Matching ──────────────────────────────────────────────────────────────────
-def match_transactions(ynab_txs: list, bank_txs: list, aliases: dict = None, config: dict = None) -> list:
-    """
-    Versucht, YNAB- und Bank-Transaktionen zu paaren.
-    Rückgabe: Liste von Match-Dicts mit type='matched'|'ynab_only'|'ynab_deferred'|'bank_only'
-    - ynab_deferred: YNAB-Einträge von Dauerbuchern (werden automatisch übersprungen)
-    Aliases werden beim Payee-Score berücksichtigt.
-    """
-    if aliases is None:
-        aliases = {}
-    if config is None:
-        config = {"deferred_payees": []}
-    used_bank = set()
-    matched_ynab = {}  # ynab_idx → (bank_idx, score)
 
-    for yi, yt in enumerate(ynab_txs):
-        ynab_amount = yt["amount"] / 1000.0
-        ynab_date   = datetime.strptime(yt["date"], "%Y-%m-%d").date()
-        ynab_payee  = (yt.get("payee_name") or "").lower()
+def find_csv_files(folder: Path) -> list:
+    return sorted(folder.glob("*.csv"))
 
-        best_score = -1
-        best_bi    = None
-
-        for bi, bt in enumerate(bank_txs):
-            if bi in used_bank:
-                continue
-
-            bank_amount = bt["amount"]
-            bank_date   = bt["date"]
-            # Alias anwenden: bekannter Bank-Payee → YNAB-Payee-Name
-            resolved    = resolve_alias(bt["payee"], aliases)
-            bank_payee  = resolved.lower()
-
-            # --- Betrags-Score (wichtigster Faktor) ---
-            amount_diff = abs(ynab_amount - bank_amount)
-            rel_diff    = amount_diff / max(abs(ynab_amount), 0.01)
-            if amount_diff < 0.01:
-                amount_score = 1.0
-            elif amount_diff < 0.05:
-                amount_score = 0.95    # Rundungsdifferenz
-            elif rel_diff < 0.05:
-                amount_score = 0.75    # bis 5% Abweichung (z.B. Pfand)
-            elif rel_diff < 0.15:
-                amount_score = 0.40    # bis 15%
-            else:
-                continue               # zu weit weg
-
-            # --- Datum-Score ---
-            days_diff = abs((ynab_date - bank_date).days)
-            if days_diff == 0:
-                date_score = 1.0
-            elif days_diff <= 3:
-                date_score = 0.85
-            elif days_diff <= 14:
-                date_score = 0.55
-            elif days_diff <= 30:
-                date_score = 0.25
-            else:
-                date_score = 0.0
-
-            # --- Payee-Score ---
-            payee_score = difflib.SequenceMatcher(
-                None, ynab_payee, bank_payee
-            ).ratio()
-
-            # Gesamt: Betrag am wichtigsten, dann Datum, dann Payee
-            total = amount_score * 0.60 + date_score * 0.25 + payee_score * 0.15
-
-            if total > best_score:
-                best_score = total
-                best_bi    = bi
-
-        if best_bi is not None and best_score > 0.3:
-            # Konflikt: Bank-Transaktion bereits besser vergeben?
-            if best_bi in {v[0] for v in matched_ynab.values()}:
-                existing_yi = next(k for k, v in matched_ynab.items() if v[0] == best_bi)
-                if best_score > matched_ynab[existing_yi][1]:
-                    # Neue YNAB-Transaktion ist besserer Match → alte verdrängen
-                    del matched_ynab[existing_yi]
-                    matched_ynab[yi] = (best_bi, best_score)
-                # else: bestehender Match bleibt
-            else:
-                matched_ynab[yi] = (best_bi, best_score)
-
-    # Ergebnisse aufbauen
-    used_bank_final = set()
-    results = []
-
-    for yi, yt in enumerate(ynab_txs):
-        if yi in matched_ynab:
-            bi, score = matched_ynab[yi]
-            used_bank_final.add(bi)
-            bt = bank_txs[bi]
-            results.append({
-                "type":        "matched",
-                "ynab":        yt,
-                "bank":        bt,
-                "score":       score,
-                "amount_diff": abs(yt["amount"] / 1000.0 - bt["amount"])
-            })
-        else:
-            payee_name = yt.get("payee_name") or ""
-            tx_type = "ynab_deferred" if is_deferred_payee(payee_name, config) else "ynab_only"
-            results.append({"type": tx_type, "ynab": yt, "bank": None, "score": 0})
-
-    for bi, bt in enumerate(bank_txs):
-        if bi not in used_bank_final:
-            results.append({"type": "bank_only", "ynab": None, "bank": bt, "score": 0})
-
-    # Sortierung: gute Matches zuerst, dann YNAB-only, dann Bank-only
-    def sort_key(r):
-        if r["type"] == "matched":   return (0, -r["score"])
-        if r["type"] == "ynab_only": return (1, 0)
-        return (2, 0)
-
-    results.sort(key=sort_key)
-    return results
 
 # ── Anzeige einer Transaktion ─────────────────────────────────────────────────
 def show_match(match: dict, idx: int, total: int):
@@ -730,25 +319,24 @@ def show_match(match: dict, idx: int, total: int):
         print()
         print(f"  {bold('Bank:')}  {bt['date']}  {fmt_eur(bt['amount']):>18}  {bt['payee']}")
 
+
 # ── Interaktiver Abgleich ─────────────────────────────────────────────────────
 def _offer_alias(bank_payee: str, ynab_payee: str, aliases: dict) -> None:
-    """Fragt ob ein Payee-Alias gespeichert werden soll (nur wenn Payees wirklich abweichen)."""
     if not bank_payee or not ynab_payee:
         return
     if bank_payee.lower().strip() == ynab_payee.lower().strip():
         return
-    # Nicht anbieten wenn schon ein Alias existiert
     if resolve_alias(bank_payee, aliases) != bank_payee:
         return
     similarity = difflib.SequenceMatcher(None, bank_payee.lower(), ynab_payee.lower()).ratio()
-    # Nur anbieten wenn Payees wirklich verschieden (< 80% Ähnlichkeit)
     if similarity >= 0.80:
         return
     prompt = dim(f'Alias merken?  Bank: "{bank_payee}" → YNAB: "{ynab_payee}"  [j/N]:')
     ans = input(f"  {prompt} ").strip().lower()
     if ans == "j":
         save_alias(bank_payee, ynab_payee)
-        aliases[bank_payee.lower().strip()] = ynab_payee  # auch in-memory aktualisieren
+        aliases[bank_payee.lower().strip()] = ynab_payee
+        print(ok(f"  💾 Alias gespeichert: '{bank_payee}' → '{ynab_payee}'"))
 
 
 def interactive_reconcile(matches: list, budget_id: str, account_id: str, token: str,
@@ -762,30 +350,29 @@ def interactive_reconcile(matches: list, budget_id: str, account_id: str, token:
         payees = []
     if categories is None:
         categories = []
-    to_clear   = []   # [transaction_id, ...]
-    to_update  = []   # [{"id":..., "amount":..., "cleared":"cleared"}, ...]
-    to_create  = []   # [full transaction dict, ...]
-    skipped    = 0
-    deferred   = 0    # automatisch übersprungene Dauerbucher
 
-    # Dauerbucher vorab zählen und aus interaktivem Loop herausfiltern
-    active_matches  = [m for m in matches if m["type"] != "ynab_deferred"]
+    to_clear  = []
+    to_update = []
+    to_create = []
+    skipped   = 0
+
+    active_matches   = [m for m in matches if m["type"] != "ynab_deferred"]
     deferred_matches = [m for m in matches if m["type"] == "ynab_deferred"]
     deferred = len(deferred_matches)
     if deferred:
+        names = ', '.join(set(m['ynab'].get('payee_name', '?') for m in deferred_matches[:3]))
         print(info(f"\n⏭️  {deferred} Dauerbucher-Einträge automatisch übersprungen "
-                   f"({', '.join(set(m['ynab'].get('payee_name','?') for m in deferred_matches[:3]))}{'…' if deferred > 3 else ''})"))
+                   f"({names}{'…' if deferred > 3 else ''})"))
 
     total = len(active_matches)
 
     for idx, match in enumerate(active_matches, 1):
         show_match(match, idx, total)
 
-        # ── Gematchte Transaktion ──────────────────────────────────────────────
         if match["type"] == "matched":
             yt = match["ynab"]
             bt = match["bank"]
-            has_diff = match["amount_diff"] > 0.01
+            has_diff  = match["amount_diff"] > 0.01
             high_conf = match["score"] >= 0.85 and not has_diff
 
             if high_conf:
@@ -821,7 +408,6 @@ def interactive_reconcile(matches: list, budget_id: str, account_id: str, token:
                 skipped += 1
                 print(warn("  ⏭️  Übersprungen."))
 
-        # ── Nur in YNAB ────────────────────────────────────────────────────────
         elif match["type"] == "ynab_only":
             print(f"\n  {bold('[s]')}kip/ausstehend  {bold('[c]')}lear trotzdem  "
                   f"{bold('[i]')}mmer überspringen  {dim('(Enter = skip)')}")
@@ -832,14 +418,16 @@ def interactive_reconcile(matches: list, budget_id: str, account_id: str, token:
                 print(ok("  ✅ Wird trotzdem gecleared."))
             elif action == "i":
                 payee_name = match["ynab"].get("payee_name", "")
-                add_deferred_payee(payee_name, config)
+                keyword = add_deferred_payee(payee_name, config)
                 skipped += 1
-                print(info("  🔄 Als Dauerbucher gespeichert – wird künftig automatisch übersprungen."))
+                if keyword:
+                    print(ok(f"  💾 '{keyword}' als Dauerbucher gespeichert – wird künftig automatisch übersprungen."))
+                else:
+                    print(info("  🔄 Bereits als Dauerbucher bekannt."))
             else:
                 skipped += 1
                 print(info("  ⏳ Bleibt offen."))
 
-        # ── Nur in Bank ────────────────────────────────────────────────────────
         elif match["type"] == "bank_only":
             bt = match["bank"]
             print(f"\n  {bold('[a]')}nlegen in YNAB  {bold('[s]')}kip  {dim('(Enter = skip)')}")
@@ -859,7 +447,7 @@ def interactive_reconcile(matches: list, budget_id: str, account_id: str, token:
                 skipped += 1
                 print(warn("  ⏭️  Übersprungen."))
 
-    # ── Zusammenfassung & Bestätigung ─────────────────────────────────────────
+    # Zusammenfassung & Bestätigung
     print(f"\n{'═' * 62}")
     print(bold(" Zusammenfassung der geplanten Änderungen:"))
     print(f"  Transaktionen clearen:      {len(to_clear)}")
@@ -878,30 +466,26 @@ def interactive_reconcile(matches: list, budget_id: str, account_id: str, token:
         print(warn("Abgebrochen. Keine Änderungen vorgenommen."))
         return
 
-    # Ausführen
     if to_clear:
         payload = {"transactions": [{"id": tid, "cleared": "cleared"} for tid in to_clear]}
-        result  = api_patch(f"/budgets/{budget_id}/transactions", payload, token)
-        if result:
-            print(ok(f"  ✅ {len(to_clear)} Transaktionen gecleared."))
+        api_patch(f"/budgets/{budget_id}/transactions", payload, token)
+        print(ok(f"  ✅ {len(to_clear)} Transaktionen gecleared."))
 
     if to_update:
         payload = {"transactions": to_update}
-        result  = api_patch(f"/budgets/{budget_id}/transactions", payload, token)
-        if result:
-            print(ok(f"  ✅ {len(to_update)} Transaktionen aktualisiert und gecleared."))
+        api_patch(f"/budgets/{budget_id}/transactions", payload, token)
+        print(ok(f"  ✅ {len(to_update)} Transaktionen aktualisiert und gecleared."))
 
     if to_create:
         payload = {"transactions": to_create}
-        result  = api_post(f"/budgets/{budget_id}/transactions", payload, token)
-        if result:
-            print(ok(f"  ✅ {len(to_create)} Transaktionen neu angelegt."))
+        api_post(f"/budgets/{budget_id}/transactions", payload, token)
+        print(ok(f"  ✅ {len(to_create)} Transaktionen neu angelegt."))
 
     print(ok("\n🎉 Abgleich abgeschlossen!"))
 
-# ── Reconcile ────────────────────────────────────────────────────────────────
+
+# ── Reconcile ─────────────────────────────────────────────────────────────────
 def _do_reconcile(budget_id: str, account_id: str, token: str) -> bool:
-    """Markiert alle 'cleared' Transaktionen des Kontos als 'reconciled'."""
     txs_data    = api_get(f"/budgets/{budget_id}/accounts/{account_id}/transactions", token)
     cleared_txs = [t for t in txs_data["data"]["transactions"] if t.get("cleared") == "cleared"]
 
@@ -910,20 +494,13 @@ def _do_reconcile(budget_id: str, account_id: str, token: str) -> bool:
         return False
 
     payload = {"transactions": [{"id": t["id"], "cleared": "reconciled"} for t in cleared_txs]}
-    result  = api_patch(f"/budgets/{budget_id}/transactions", payload, token)
-    if result:
-        print(ok(f"  ✅ {len(cleared_txs)} Transaktionen auf 'reconciled' gesetzt."))
-        print(ok("  🏦 Konto erfolgreich abgeschlossen!"))
-        return True
-    return False
+    api_patch(f"/budgets/{budget_id}/transactions", payload, token)
+    print(ok(f"  ✅ {len(cleared_txs)} Transaktionen auf 'reconciled' gesetzt."))
+    print(ok("  🏦 Konto erfolgreich abgeschlossen!"))
+    return True
 
 
 def offer_reconcile(budget_id: str, account_id: str, account_name: str, token: str):
-    """
-    Zeigt nach dem Abgleich die Kontostände (YNAB cleared vs. Bank) und
-    bietet Reconcile an wenn sie übereinstimmen – oder mit Ausgleichsbuchung wenn nicht.
-    """
-    # Frischen Kontostand direkt vom Server holen
     account_data    = api_get(f"/budgets/{budget_id}/accounts/{account_id}", token)
     account         = account_data["data"]["account"]
     cleared_balance = account["cleared_balance"] / 1000.0
@@ -950,13 +527,11 @@ def offer_reconcile(budget_id: str, account_id: str, account_name: str, token: s
     print(f"  Bank:               {fmt_eur(bank_balance)}")
 
     if abs(diff) < 0.01:
-        # Salden stimmen überein – direkt reconcilen
         print(ok("  ✅ Salden stimmen überein!"))
         confirm = input(f"\n  {bold('Konto jetzt reconcilen? [j/N]:')} ").strip().lower()
         if confirm == "j":
             _do_reconcile(budget_id, account_id, token)
     else:
-        # Differenz vorhanden
         print(warn(f"\n  ⚠️  Differenz: {diff:+.2f} €"))
         print(f"\n  {bold('[a]')}usgleichsbuchung ({diff:+.2f} €) erstellen und reconcilen")
         print(f"  {bold('[s]')}kip – kein Reconcile")
@@ -971,21 +546,15 @@ def offer_reconcile(budget_id: str, account_id: str, account_name: str, token: s
                 "memo":       "Reconciliation balance adjustment",
                 "cleared":    "cleared"
             }
-            result = api_post(f"/budgets/{budget_id}/transactions", {"transaction": adj}, token)
-            if result:
-                print(ok(f"  ✅ Ausgleichsbuchung über {diff:+.2f} € angelegt."))
-                _do_reconcile(budget_id, account_id, token)
+            api_post(f"/budgets/{budget_id}/transactions", {"transaction": adj}, token)
+            print(ok(f"  ✅ Ausgleichsbuchung über {diff:+.2f} € angelegt."))
+            _do_reconcile(budget_id, account_id, token)
         else:
             print(dim("  Reconcile übersprungen."))
 
 
 # ── Hilfsfunktion: ein Konto abgleichen ──────────────────────────────────────
 def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict) -> bool:
-    """
-    Führt den vollständigen Abgleich für ein Konto durch.
-    Gibt True zurück wenn erfolgreich, False wenn abgebrochen.
-    """
-    # Konten mit offenen Transaktionen laden (frisch vom Server)
     accounts_data = api_get(f"/budgets/{budget['id']}/accounts", token)
     accounts = [
         a for a in accounts_data["data"]["accounts"]
@@ -1010,11 +579,10 @@ def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict)
         account = accounts[int(choice) - 1]
     except (ValueError, IndexError):
         print(err("Ungültige Auswahl."))
-        return True  # Schleife fortsetzen
+        return True
 
     print(ok(f"✅ Konto: {account['name']}"))
 
-    # Offene YNAB-Transaktionen laden
     txs_data  = api_get(f"/budgets/{budget['id']}/accounts/{account['id']}/transactions", token)
     uncleared = [t for t in txs_data["data"]["transactions"] if t.get("cleared") == "uncleared"]
 
@@ -1026,7 +594,6 @@ def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict)
     for t in sorted(uncleared, key=lambda x: x["date"]):
         print(f"  {dim(t['date'])}  {fmt_eur(t['amount']/1000):>18}  {t.get('payee_name') or '—'}")
 
-    # Bank-Transaktionen: CSV oder manuell eingeben?
     script_dir = Path(__file__).parent
     csv_files  = find_csv_files(script_dir)
 
@@ -1059,7 +626,9 @@ def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict)
         except (ValueError, IndexError):
             csv_path = csv_files[0]
         print(ok(f"✅ Lade: {csv_path.name}"))
-        bank_txs = parse_finanzblick_csv(str(csv_path))
+        bank_txs, skipped = parse_finanzblick_csv(str(csv_path))
+        if skipped:
+            print(warn(f"⚠️  {len(skipped)} Zeile(n) übersprungen (nicht parsbar)."))
 
     if not bank_txs:
         print(warn("Keine Bank-Transaktionen eingegeben."))
@@ -1067,13 +636,11 @@ def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict)
 
     print(ok(f"\n✅ {len(bank_txs)} Bank-Transaktionen gelesen."))
 
-    # YNAB-Stammdaten für den Anlegen-Dialog laden
     print(dim("  Lade Payees und Kategorien aus YNAB…"), end="", flush=True)
     payees     = load_ynab_payees(budget["id"], token)
     categories = load_ynab_categories(budget["id"], token)
     print(ok(f" {len(payees)} Payees, {len(categories)} Kategorien geladen."))
 
-    # Matching
     matches = match_transactions(uncleared, bank_txs, aliases, config)
 
     n_matched   = sum(1 for m in matches if m["type"] == "matched")
@@ -1092,7 +659,6 @@ def run_account_reconcile(budget: dict, token: str, aliases: dict, config: dict)
     interactive_reconcile(matches, budget["id"], account["id"], token,
                           aliases, config, payees, categories)
 
-    # Nach dem Abgleich: Reconcile anbieten
     offer_reconcile(budget["id"], account["id"], account["name"], token)
     return True
 
@@ -1103,7 +669,12 @@ def main():
     print(bold("  YNAB Abgleich-Tool"))
     print("=" * 62)
 
-    token   = load_token()
+    try:
+        token = load_token()
+    except TokenNotFoundError as e:
+        print(err(f"❌ {e}"))
+        sys.exit(1)
+
     aliases = load_aliases()
     config  = load_config()
 
@@ -1112,8 +683,12 @@ def main():
     if config.get("deferred_payees"):
         print(info(f"🔄 {len(config['deferred_payees'])} Dauerbucher-Regel(n) aktiv."))
 
-    # Budget wählen (archivierte ausblenden)
-    budgets_data = api_get("/budgets", token)
+    try:
+        budgets_data = api_get("/budgets", token)
+    except APIError as e:
+        print(err(f"❌ API-Fehler: {e}"))
+        sys.exit(1)
+
     budgets = [b for b in budgets_data["data"]["budgets"]
                if "Archived" not in b.get("name", "")]
 
@@ -1131,15 +706,18 @@ def main():
             budget = budgets[0]
         print(ok(f"✅ Budget: {budget['name']}"))
 
-    # Konto-Schleife: nach jedem Abgleich weiteres Konto anbieten
-    while True:
-        continue_loop = run_account_reconcile(budget, token, aliases, config)
-        if not continue_loop:
-            break
-        print()
-        weiter = input(bold("Weiteres Konto abgleichen? [J/n]: ")).strip().lower()
-        if weiter == "n":
-            break
+    try:
+        while True:
+            continue_loop = run_account_reconcile(budget, token, aliases, config)
+            if not continue_loop:
+                break
+            print()
+            weiter = input(bold("Weiteres Konto abgleichen? [J/n]: ")).strip().lower()
+            if weiter == "n":
+                break
+    except APIError as e:
+        print(err(f"\n❌ API-Fehler: {e}"))
+        sys.exit(1)
 
     print(ok("\n👋 Auf Wiedersehen!"))
 
@@ -1148,4 +726,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{warn('Abgebrochen.')}")
+        print(warn("\n\nAbgebrochen."))
+        sys.exit(0)

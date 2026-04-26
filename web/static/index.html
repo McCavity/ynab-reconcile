@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YNAB Abgleich</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ── Setup ──────────────────────────────────────────────────────────────── -->
+<div id="view-setup" class="view active">
+  <header>
+    <h1>YNAB Abgleich</h1>
+  </header>
+  <main class="setup-layout">
+
+    <div class="card setup-form">
+      <h2>Abgleich starten</h2>
+
+      <div class="setup-row">
+        <label>Budget
+          <select id="budget-select" disabled>
+            <option value="">Lade…</option>
+          </select>
+        </label>
+
+        <label>Konto
+          <select id="account-select" disabled>
+            <option value="">Erst Budget wählen</option>
+          </select>
+        </label>
+      </div>
+
+      <label>Finanzblick CSV
+        <div class="file-drop" id="file-drop">
+          <span id="file-label">Datei auswählen oder hierher ziehen</span>
+          <input type="file" id="csv-input" accept=".csv">
+        </div>
+      </label>
+
+      <button id="start-btn" class="btn primary" disabled>Abgleich starten</button>
+      <p id="setup-error" class="error hidden"></p>
+    </div>
+
+    <!-- Transaction preview (shown once account is selected) -->
+    <div id="tx-preview" class="card hidden">
+      <div class="tx-preview-header">
+        <h2>Offene Transaktionen</h2>
+        <div class="filter-tabs">
+          <button class="filter-tab active" data-filter="all">
+            Alle&nbsp;<span class="filter-count" id="count-all">0</span>
+          </button>
+          <button class="filter-tab" data-filter="cleared">
+            Gecleared&nbsp;<span class="filter-count" id="count-cleared">0</span>
+          </button>
+          <button class="filter-tab" data-filter="uncleared">
+            Offen&nbsp;<span class="filter-count" id="count-uncleared">0</span>
+          </button>
+        </div>
+      </div>
+      <div id="tx-preview-list" class="tx-preview-list">
+        <p class="tx-loading">Lade…</p>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ── Matching ───────────────────────────────────────────────────────────── -->
+<div id="view-matching" class="view">
+  <header>
+    <div class="header-left">
+      <h1>YNAB Abgleich</h1>
+      <span id="match-stats" class="stats"></span>
+    </div>
+    <div class="header-actions">
+      <button id="confirm-all-btn" class="btn secondary">Alle bestätigen</button>
+      <button id="apply-btn" class="btn primary">Speichern</button>
+    </div>
+  </header>
+  <main class="match-layout">
+
+    <!-- Matched pairs -->
+    <section id="pairs-section" class="card match-section">
+      <div class="section-title-row">
+        <span class="section-title">Zugeordnete Paare</span>
+        <span id="pairs-count" class="section-count"></span>
+      </div>
+      <div class="col-labels">
+        <span>YNAB</span>
+        <span></span>
+        <span>Bank</span>
+      </div>
+      <div id="pairs-list"></div>
+      <p id="pairs-empty" class="pool-empty hidden">Noch keine Zuordnungen – ziehe Karten aus den Pools unten.</p>
+    </section>
+
+    <!-- Unmatched pools -->
+    <div class="pools-section">
+      <section class="card pool-section" id="ynab-pool-section">
+        <div class="section-title-row">
+          <span class="section-title">YNAB – nicht zugeordnet</span>
+          <span id="ynab-pool-count" class="section-count"></span>
+        </div>
+        <div id="ynab-pool-list" class="pool-list" data-side="ynab"></div>
+        <p id="ynab-pool-empty" class="pool-empty hidden">Alle YNAB-Transaktionen zugeordnet ✅</p>
+      </section>
+      <section class="card pool-section" id="bank-pool-section">
+        <div class="section-title-row">
+          <span class="section-title">Bank – nicht zugeordnet</span>
+          <span id="bank-pool-count" class="section-count"></span>
+        </div>
+        <div id="bank-pool-list" class="pool-list" data-side="bank"></div>
+        <p id="bank-pool-empty" class="pool-empty hidden">Alle Bank-Transaktionen zugeordnet ✅</p>
+      </section>
+    </div>
+
+  </main>
+</div>
+
+<!-- ── Reconcile ──────────────────────────────────────────────────────────── -->
+<div id="view-reconcile" class="view">
+  <header>
+    <h1>YNAB Abgleich</h1>
+  </header>
+  <main class="card">
+    <h2>Konto abschließen</h2>
+    <div id="balance-info" class="balance-info"></div>
+
+    <label>Kontostand laut Bank
+      <input type="text" id="bank-balance-input" placeholder="z.B. 1.234,56" autocomplete="off">
+    </label>
+
+    <div id="reconcile-diff" class="reconcile-diff hidden"></div>
+
+    <div class="btn-row">
+      <button id="reconcile-btn" class="btn primary">Konto reconcilen</button>
+      <button id="skip-reconcile-btn" class="btn secondary">Überspringen</button>
+    </div>
+    <p id="reconcile-error" class="error hidden"></p>
+  </main>
+</div>
+
+<!-- ── Done ───────────────────────────────────────────────────────────────── -->
+<div id="view-done" class="view">
+  <header><h1>YNAB Abgleich</h1></header>
+  <main class="card done-card">
+    <div class="done-icon">✅</div>
+    <h2>Abgeschlossen!</h2>
+    <p id="done-summary"></p>
+    <button id="restart-btn" class="btn primary">Neuen Abgleich starten</button>
+  </main>
+</div>
+
+<!-- ── Modals ──────────────────────────────────────────────────────────────── -->
+<div id="modal-overlay" class="modal-overlay hidden">
+  <!-- Create transaction modal -->
+  <div id="modal-create" class="modal hidden">
+    <h3>Transaktion in YNAB anlegen</h3>
+    <label>Datum <input type="text" id="create-date" placeholder="TT.MM.JJJJ"></label>
+    <label>Betrag <input type="text" id="create-amount" placeholder="z.B. -45,90"></label>
+    <label>Payee
+      <input type="text" id="create-payee-input" placeholder="Suchen…" autocomplete="off">
+      <ul id="create-payee-results" class="autocomplete-list hidden"></ul>
+    </label>
+    <label>Kategorie
+      <input type="text" id="create-category-input" placeholder="Suchen…" autocomplete="off">
+      <ul id="create-category-results" class="autocomplete-list hidden"></ul>
+      <input type="hidden" id="create-category-id">
+    </label>
+    <label>Memo <input type="text" id="create-memo" placeholder="Optional"></label>
+    <div class="modal-actions">
+      <button id="create-save-btn" class="btn primary">Speichern</button>
+      <button id="create-cancel-btn" class="btn secondary">Abbrechen</button>
+    </div>
+  </div>
+
+  <!-- Edit pair modal -->
+  <div id="modal-edit-pair" class="modal hidden">
+    <h3>Transaktion bearbeiten</h3>
+    <p id="edit-pair-desc" class="modal-desc"></p>
+    <label>Betrag <input type="text" id="edit-pair-amount" placeholder="z.B. -45,90"></label>
+    <label>Memo <input type="text" id="edit-pair-memo" placeholder="Optional"></label>
+    <label>Payee
+      <input type="text" id="edit-pair-payee-input" placeholder="Suchen…" autocomplete="off">
+      <ul id="edit-pair-payee-results" class="autocomplete-list hidden"></ul>
+    </label>
+    <label>Kategorie
+      <input type="text" id="edit-pair-category-input" placeholder="Suchen…" autocomplete="off">
+      <ul id="edit-pair-category-results" class="autocomplete-list hidden"></ul>
+      <input type="hidden" id="edit-pair-category-id">
+    </label>
+    <div class="modal-actions">
+      <button id="edit-pair-save" class="btn primary">Bestätigen & Speichern</button>
+      <button id="edit-pair-cancel" class="btn secondary">Abbrechen</button>
+    </div>
+  </div>
+
+  <!-- Match confirmation modal (drag & drop) -->
+  <div id="modal-match-confirm" class="modal hidden">
+    <h3>Zuordnung bestätigen?</h3>
+    <div class="confirm-match-preview">
+      <div class="confirm-side">
+        <div class="confirm-side-label">YNAB</div>
+        <div id="confirm-ynab-preview"></div>
+      </div>
+      <div class="confirm-arrow">🔗</div>
+      <div class="confirm-side">
+        <div class="confirm-side-label">Bank</div>
+        <div id="confirm-bank-preview"></div>
+      </div>
+    </div>
+    <p id="confirm-match-warning" class="warn-text hidden"></p>
+    <div class="modal-actions">
+      <button id="confirm-match-yes" class="btn primary">Ja, zuordnen</button>
+      <button id="confirm-match-no" class="btn secondary">Abbrechen</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
